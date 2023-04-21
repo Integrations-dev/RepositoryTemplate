@@ -79,7 +79,7 @@ ENDPOINT
 ```
 
 You must create a GitHub Secret for providing the Channel Endpoint  by
-  - Go to the Repository where the CliqInformer will be added and go to the '**Settings**' tab.
+  - Go to the Repository where the GitHub Informer will be added and go to the '**Settings**' tab.
   - Select '**Secrets and variables**' and click on '**Actions**' in the dropdown.
   - Click on '**New repository secret**' and enter the name as '**ENDPOINT**' and also enter the Cliq channel endpoint  as the Secret (in above mentioned format)
 
@@ -98,7 +98,7 @@ jobs:
   test_name:
     runs-on: ubuntu-latest
     steps:
-      - uses: Integrations-dev/CliqInformer@v1
+      - uses: Integrations-dev/GitHub-Informer@v1
         with:
           channel-endpoint: ${{ secrets.ENDPOINT }}
 ```
