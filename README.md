@@ -1,7 +1,7 @@
 # RepositoryTemplate 📔
 This is the Template Repository in which the GitHub Action can perform well on cloning.
 
-Users can efficiently utilise the CliqInformer  by cloning the Repository using the commands. 
+Users can efficiently utilise the GitHub Informer by cloning the Repository using the commands. 
 
 ```
 git clone https://<GITHUB PERSONAL ACCESS TOKEN>@github.com/Integrations-dev/RepositoryTemplate
@@ -16,7 +16,7 @@ and Click on Generate new Token and select the Expiration Period and Select the 
 
 Since we will be pushing the code to the Repository, A Scope 🛡️ of **public_repo** is required for public repositories and **repo** is required for all (private and public) repositories.
 
-Once cloned , you are all ready to utilise the CliqInformer GitHub Aciton.
+Once cloned , you are all ready to utilise the GitHub Informer GitHub Aciton.
 
 ## Custom Event Messages ⚙️
 
