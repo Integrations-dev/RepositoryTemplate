@@ -1,5 +1,52 @@
 name : Communicating with Cliq
 
+# ============================================================================
+# CliqConnector.yml — Zoho Cliq notification + AI PR review workflow
+#
+# This file is meant to be copied as-is into the consuming repository at
+# .github/workflows/CliqConnector.yml.
+#
+# Strict configuration model:
+#   - All non-secret configuration values MUST be stored in repository/org
+#     Variables (Settings -> Secrets and variables -> Actions -> Variables).
+#   - No non-secret value should be hardcoded in this file.
+#   - Only the following are stored as environment secrets:
+#       - PROJECT_TOKEN
+#       - ENDPOINT
+#       - AI_REVIEW_TOKEN
+#       - GITHUB_TOKEN (provided automatically by GitHub Actions)
+#
+# USER-CONFIGURABLE FIELDS — where each one is set:
+#
+#   A) Repo/Org Variables  (Settings -> Secrets and variables -> Actions -> Variables)
+#        - CLIQ_NOTIFICATION_MODE    optional ("user" or "bot")
+#        - CLIQ_BOT_UNIQUE_NAME      required only when CLIQ_NOTIFICATION_MODE=bot
+#        - CLIQ_THREAD_STORAGE_MODE  optional ("comment" or "project")
+#                                    Use "project" only if you want PR thread reuse.
+#        - PROJECT_NUMBER            required only when CLIQ_THREAD_STORAGE_MODE=project;
+#                                    GitHub Project (v2) number to log PR threads into;
+#                                    e.g. the "1" in https://github.com/orgs/<orgname>/projects/1
+#        - PROJECT_THREAD_FIELD_ID   required only when CLIQ_THREAD_STORAGE_MODE=project;
+#                                    numeric field id or PVTF_* node id for the Cliq-thread field.
+#        - AI_REVIEW_ENABLED         optional (true | false)
+#        - AI_REVIEW_SERVICE         optional when disabled; otherwise openai | claude | gemini
+#        - AI_REVIEW_MODEL           optional when disabled; model for the chosen service
+#
+#   B) Environment Secrets  (Settings -> Environments -> cliq-production -> Secrets)
+#      Required. Must live in the protected "cliq-production" environment,
+#      NOT as plain repo secrets.
+#        - PROJECT_TOKEN      (classic GitHub PAT with repo + project scopes)
+#        - ENDPOINT           (Zoho Cliq incoming webhook URL)
+#        - AI_REVIEW_TOKEN    (API key for the AI provider; required only if
+#                              AI_REVIEW_ENABLED is true)
+#        - GITHUB_TOKEN       (automatic GitHub Actions token)
+#
+#   C) One-time GitHub setup (no yml edits):
+#        - Run this workflow once on a real PR so the "AI Review Gate" check
+#          context is registered, then add it as a required status check in
+#          Branch Protection / Rules.
+# ============================================================================
+
 on:
   branch_protection_rule:
     #types : [created , edited , deleted]
@@ -36,9 +83,10 @@ on:
     # No Types
   public:
     # No Types
-  pull_request:
-    # It works only for opened , synchronize and reopened if not specified
-    types: [ assigned , unassigned , labeled , unlabeled , opened , closed , edited , reopened , synchronize , converted_to_draft , ready_for_review , locked , unlocked , review_requested , review_request_removed , auto_merge_enabled , auto_merge_disabled ]
+  # pull_request disabled to avoid duplicate PR created/closed notifications.
+  # PR handling is done only through pull_request_target below.
+  # pull_request:
+  #   types: [ opened , reopened , synchronize , closed ]
   pull_request_target:
     # It works only for opened , synchronize and reopened if not specified
     types: [ assigned , unassigned , labeled , unlabeled , opened , closed , edited , reopened , synchronize , converted_to_draft , ready_for_review , locked , unlocked , review_requested , review_request_removed , auto_merge_enabled , auto_merge_disabled ]
@@ -65,14 +113,369 @@ on:
     # types : [started]
   workflow_dispatch:
     # No Types
+
+permissions:
+  contents: read
+  checks: write
+  issues: write
+  pull-requests: write
+  repository-projects: write
   
 jobs:
   connecting_cliq:
     runs-on: ubuntu-latest
+    # Gates ENDPOINT, PROJECT_TOKEN and AI_REVIEW_TOKEN behind a protected
+    # GitHub Environment. Only repo/org Admins (or designated required
+    # reviewers) can view, create, or modify these secrets, and runs against
+    # this environment can be restricted to protected branches only.
+    # Configure this in: Settings -> Environments -> cliq-production
+    environment: cliq-production
+    env:
+      # ---------------------------------------------------------------------
+      # (A) Repo/Org VARIABLES — optional, all have safe defaults.
+      # Set at: Settings -> Secrets and variables -> Actions -> Variables tab.
+      # ---------------------------------------------------------------------
+
+      # USER CONFIG (environment secret): PROJECT_TOKEN
+      # Classic GitHub PAT with repo + project scopes. Used for all GitHub Projects (v2)
+      # GraphQL calls used to look up the project and store/update the PR thread reference.
+      PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+
+      # USER CONFIG (repository variable): CLIQ_NOTIFICATION_MODE
+      # Values: "user" or "bot". Use "bot" to post as a configured Cliq bot
+      # instead of the webhook's default identity.
+      CLIQ_NOTIFICATION_MODE: ${{ vars.CLIQ_NOTIFICATION_MODE }}
+
+      # USER CONFIG (repository variable): CLIQ_BOT_UNIQUE_NAME
+      # Required ONLY when CLIQ_NOTIFICATION_MODE=bot above. Set it to the
+      # bot's unique name so it gets appended to the endpoint as a query param.
+      CLIQ_BOT_UNIQUE_NAME: ${{ vars.CLIQ_BOT_UNIQUE_NAME }}
+
+      # USER CONFIG (repository variable): CLIQ_USER_MODE_BOT_DISPLAY_NAME
+      # Optional override for user-mode messages. If not set, the workflow uses the
+      # default display name: "GitHub Informer for Zoho Cliq".
+      CLIQ_USER_MODE_BOT_DISPLAY_NAME: ${{ vars.CLIQ_USER_MODE_BOT_DISPLAY_NAME }}
+
+      # USER CONFIG (repository variable): CLIQ_USER_MODE_BOT_IMAGE_URL
+      # Optional override for user-mode messages. If not set, the workflow uses the
+      # default image URL fallback.
+      CLIQ_USER_MODE_BOT_IMAGE_URL: ${{ vars.CLIQ_USER_MODE_BOT_IMAGE_URL }}
+
+      # USER CONFIG (repository variable): CLIQ_THREAD_STORAGE_MODE
+      # Optional. Set to "project" only when you want PR updates to keep the
+      # same Cliq thread using a GitHub Project V2 field. If it is not enabled,
+      # the workflow posts normal channel messages and does not store a thread ID.
+      CLIQ_THREAD_STORAGE_MODE: ${{ vars.CLIQ_THREAD_STORAGE_MODE }}
+
+      # USER CONFIG (repository variable): PROJECT_THREAD_FIELD_ID
+      # Required only when CLIQ_THREAD_STORAGE_MODE=project.
+      # The GitHub Project (v2) field used to store the Cliq thread reference
+      # per PR. Use the numeric field id from the Project field settings URL,
+      # or the GraphQL node id directly (PVTF_*).
+      PROJECT_THREAD_FIELD_ID: ${{ vars.PROJECT_THREAD_FIELD_ID }}
+
+      # USER CONFIG (repository variable): PROJECT_NUMBER
+      # Required only when CLIQ_THREAD_STORAGE_MODE=project.
+      # The GitHub Project (v2) number that PRs get logged into for thread
+      # reuse. Find it in your project's URL:
+      #   https://github.com/orgs/<orgname>/projects/1
+      #                                              ^-- this is the number
+      # (org-owned projects) or https://github.com/users/<username>/projects/1
+      # (user-owned projects).
+      PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+
+      # ---------------------------------------------------------------------
+      # Repository-variable configuration for AI review.
+      # No non-secret value is hardcoded in this file.
+      # ---------------------------------------------------------------------
+
+      # USER CONFIG (repository variable): AI_REVIEW_ENABLED
+      # true  -> AI review gate runs on every PR (open/reopen, and sync if
+      #          ai-review-on-sync is true further below).
+      # false -> AI review step and its checks are skipped entirely.
+      AI_REVIEW_ENABLED: ${{ vars.AI_REVIEW_ENABLED }}
+
+      # USER CONFIG (repository variable): AI_REVIEW_SERVICE
+      # Which AI provider to call. Supported: openai | claude | gemini.
+      # The matching API key must be stored in the AI_REVIEW_TOKEN
+      # Environment secret (see cliq-production environment secrets above).
+      AI_REVIEW_SERVICE: ${{ vars.AI_REVIEW_SERVICE }}
+
+      # USER CONFIG (repository variable): AI_REVIEW_MODEL
+      # Model name for the chosen AI_REVIEW_SERVICE above.
+      AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL }}
     steps:
-      - uses: Integrations-dev/GitHub-Informer@v1
+      # ---------------------------------------------------------------------
+      # (B) Environment SECRETS — required, must be set on the protected
+      # "cliq-production" Environment (Settings -> Environments -> cliq-production
+      # -> Environment secrets), not as plain repo secrets.
+      # ---------------------------------------------------------------------
+      - name: Validate project token
+        shell: bash
+        env:
+          # USER CONFIG (environment secret): PROJECT_TOKEN
+          # Classic GitHub PAT with `repo` + `project` scopes. Used for all
+          # GitHub Projects (v2) GraphQL calls (lookup/insert PR into project).
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          CLIQ_THREAD_STORAGE_MODE: ${{ vars.CLIQ_THREAD_STORAGE_MODE }}
+        run: |
+          if [[ -z "${CLIQ_THREAD_STORAGE_MODE:-}" || "${CLIQ_THREAD_STORAGE_MODE}" != "project" ]]; then
+            echo "Skipping project token validation because CLIQ_THREAD_STORAGE_MODE is not set to project."
+            exit 0
+          fi
+
+          if [[ -z "$PROJECT_TOKEN" ]]; then
+            echo "PROJECT_TOKEN is missing. Add it as an environment secret named PROJECT_TOKEN in Settings -> Environments -> cliq-production."
+            exit 1
+          fi
+
+      - name: Validate project number and thread field id
+        shell: bash
+        env:
+          CLIQ_THREAD_STORAGE_MODE: ${{ vars.CLIQ_THREAD_STORAGE_MODE }}
+        run: |
+          if [[ -z "${CLIQ_THREAD_STORAGE_MODE:-}" || "${CLIQ_THREAD_STORAGE_MODE}" != "project" ]]; then
+            echo "Skipping project number and field validation because CLIQ_THREAD_STORAGE_MODE is not set to project."
+            exit 0
+          fi
+
+          if [[ -z "$PROJECT_NUMBER" ]]; then
+            echo "PROJECT_NUMBER is not set. Create a repo/org Variable named"
+            echo "PROJECT_NUMBER with your GitHub Project V2 number."
+            exit 1
+          fi
+          if [[ -z "$PROJECT_THREAD_FIELD_ID" ]]; then
+            echo "PROJECT_THREAD_FIELD_ID is not set. Create a repo/org Variable named"
+            echo "PROJECT_THREAD_FIELD_ID with your GitHub Project V2 field id."
+            exit 1
+          fi
+
+      - name: Prepare Cliq endpoint
+        id: prepare-cliq-endpoint
+        shell: bash
+        env:
+          # USER CONFIG (environment secret): ENDPOINT
+          # The Zoho Cliq incoming webhook URL that notifications are posted to.
+          RAW_CLIQ_ENDPOINT: ${{ secrets.ENDPOINT }}
+        run: |
+          mode=$(printf '%s' "$CLIQ_NOTIFICATION_MODE" | tr '[:upper:]' '[:lower:]')
+
+          if [[ -z "$RAW_CLIQ_ENDPOINT" ]]; then
+            echo "ENDPOINT secret is missing."
+            exit 1
+          fi
+
+          if [[ "$mode" == "bot" ]]; then
+            if [[ -z "$CLIQ_BOT_UNIQUE_NAME" ]]; then
+              echo "CLIQ_BOT_UNIQUE_NAME is required when CLIQ_NOTIFICATION_MODE=bot."
+              exit 1
+            fi
+
+            endpoint="$RAW_CLIQ_ENDPOINT"
+            if [[ "$endpoint" == *"bot_unique_name="* ]]; then
+              resolved_endpoint="$endpoint"
+            elif [[ "$endpoint" == *"?"* ]]; then
+              resolved_endpoint="$endpoint&bot_unique_name=$CLIQ_BOT_UNIQUE_NAME"
+            else
+              resolved_endpoint="$endpoint?bot_unique_name=$CLIQ_BOT_UNIQUE_NAME"
+            fi
+
+            if [[ "$resolved_endpoint" != *"bot_unique_name="* ]]; then
+              echo "Failed to construct bot endpoint with bot_unique_name query parameter."
+              exit 1
+            fi
+          else
+            resolved_endpoint="$RAW_CLIQ_ENDPOINT"
+          fi
+
+          resolved_endpoint_preview=$(printf '%s' "$resolved_endpoint" | sed -E 's/(zapikey=)[^&]+/\1***REDACTED***/g')
+          echo "resolved-endpoint=$resolved_endpoint" >> "$GITHUB_OUTPUT"
+          echo "resolved-endpoint-preview=$resolved_endpoint_preview" >> "$GITHUB_OUTPUT"
+
+      - name: Debug project configuration
+        if: ${{ github.event_name == 'pull_request_target' }}
+        shell: bash
+        env:
+          # PROJECT_TOKEN is a protected environment secret, not a repo variable.
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          CLIQ_THREAD_STORAGE_MODE: ${{ vars.CLIQ_THREAD_STORAGE_MODE }}
+          GITHUB_PROJECT_OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          PROJECT_THREAD_FIELD_ID: ${{ vars.PROJECT_THREAD_FIELD_ID }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          AI_REVIEW_CHECK_NAME: AI Review Gate
+        run: |
+          echo "Debug: event_name=$GITHUB_EVENT_NAME"
+          echo "Debug: repository=$GITHUB_REPOSITORY"
+          echo "Debug: github_ref=$GITHUB_REF"
+          echo "Debug: workflow_sha=$GITHUB_SHA"
+          echo "Debug: cliq_notification_mode=$CLIQ_NOTIFICATION_MODE"
+          if [[ -n "$CLIQ_BOT_UNIQUE_NAME" ]]; then
+            echo "Debug: cliq_bot_unique_name_present=true"
+          else
+            echo "Debug: cliq_bot_unique_name_present=false"
+          fi
+          echo "Debug: cliq_endpoint_preview=${{ steps.prepare-cliq-endpoint.outputs.resolved-endpoint-preview }}"
+          if [[ "${{ steps.prepare-cliq-endpoint.outputs.resolved-endpoint }}" == *"bot_unique_name="* ]]; then
+            echo "Debug: cliq_endpoint_has_bot_unique_name=true"
+          else
+            echo "Debug: cliq_endpoint_has_bot_unique_name=false"
+          fi
+          echo "Debug: pr_head_sha=$PR_HEAD_SHA"
+          echo "Debug: pr_base_sha=$PR_BASE_SHA"
+          echo "Debug: ai_check_name=$AI_REVIEW_CHECK_NAME"
+          echo "Debug: storage_mode=$CLIQ_THREAD_STORAGE_MODE"
+          echo "Debug: project_owner=$GITHUB_PROJECT_OWNER"
+          echo "Debug: project_number=$PROJECT_NUMBER"
+          echo "Debug: project_id=<auto-resolve via owner+number>"
+          echo "Debug: project_field_identifier=$PROJECT_THREAD_FIELD_ID"
+          echo "Debug: project_field_id=<auto-resolve by identifier or direct node id>"
+          if [[ -n "$PROJECT_TOKEN" ]]; then
+            echo "Debug: project_token_present=true"
+          else
+            echo "Debug: project_token_present=false"
+          fi
+
+      - name: Debug GitHub project lookup
+        if: ${{ github.event_name == 'pull_request_target' }}
+        shell: bash
+        env:
+          # PROJECT_TOKEN is a protected environment secret, not a repo variable.
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          GITHUB_PROJECT_OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+        run: |
+          owner="$GITHUB_PROJECT_OWNER"
+          # number here comes from the PROJECT_NUMBER env var
+          # (USER CONFIG variable: PROJECT_NUMBER, defined above).
+          number="$PROJECT_NUMBER"
+
+          echo "DebugLookup: owner=$owner number=$number"
+
+          owner_type=$(curl -sS "https://api.github.com/users/$owner" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p' | head -n 1)
+          if [[ -z "$owner_type" ]]; then
+            owner_type="Unknown"
+          fi
+          echo "DebugLookup: owner_type=$owner_type"
+
+          if [[ "$owner_type" == "Organization" ]]; then
+            query_org='{"query":"query($owner:String!,$projectNumber:Int!){organization(login:$owner){login projectV2(number:$projectNumber){id title number}}}","variables":{"owner":"'"$owner"'","projectNumber":'"$number"'}}'
+            org_status=$(curl -sS -o /tmp/org_lookup.json -w "%{http_code}" \
+              -X POST https://api.github.com/graphql \
+              -H "Authorization: Bearer $PROJECT_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$query_org")
+            echo "DebugLookup: org_query_status=$org_status"
+            tr -d '\n' </tmp/org_lookup.json | sed 's/.\{900\}$/.../;q'
+            echo
+            echo "DebugLookup: user_query_skipped (owner is Organization)"
+          else
+            query_user='{"query":"query($owner:String!,$projectNumber:Int!){user(login:$owner){login projectV2(number:$projectNumber){id title number}}}","variables":{"owner":"'"$owner"'","projectNumber":'"$number"'}}'
+            user_status=$(curl -sS -o /tmp/user_lookup.json -w "%{http_code}" \
+              -X POST https://api.github.com/graphql \
+              -H "Authorization: Bearer $PROJECT_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$query_user")
+            echo "DebugLookup: user_query_status=$user_status"
+            tr -d '\n' </tmp/user_lookup.json | sed 's/.\{900\}$/.../;q'
+            echo
+            echo "DebugLookup: org_query_skipped (owner is User)"
+          fi
+
+          echo "DebugLookup: id_query_skipped (auto mode uses owner+number)"
+
+      - name: Ensure PR is in Project table
+        if: ${{ github.event_name == 'pull_request_target' }}
+        shell: bash
+        env:
+          # PROJECT_TOKEN is a protected environment secret, not a repo variable.
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          GITHUB_PROJECT_OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          owner="$GITHUB_PROJECT_OWNER"
+          number="$PROJECT_NUMBER"
+          pr="$PR_NUMBER"
+          repo="$REPO_NAME"
+
+          owner_type=$(curl -sS "https://api.github.com/users/$owner" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p' | head -n 1)
+
+          if [[ "$owner_type" == "Organization" ]]; then
+            project_query='{"query":"query($owner:String!,$projectNumber:Int!){organization(login:$owner){projectV2(number:$projectNumber){id}}}","variables":{"owner":"'"$owner"'","projectNumber":'"$number"'}}'
+          else
+            project_query='{"query":"query($owner:String!,$projectNumber:Int!){user(login:$owner){projectV2(number:$projectNumber){id}}}","variables":{"owner":"'"$owner"'","projectNumber":'"$number"'}}'
+          fi
+
+          project_body=$(curl -sS -X POST https://api.github.com/graphql \
+            -H "Authorization: Bearer $PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$project_query")
+
+          project_id=$(echo "$project_body" | sed -n 's/.*"projectV2":{\"id\":\"\([^\"]*\)\"}.*/\1/p')
+          if [[ -z "$project_id" ]]; then
+            project_id=$(echo "$project_body" | sed -n 's/.*"projectV2":{"id":"\([^"]*\)"}.*/\1/p')
+          fi
+
+          if [[ -z "$project_id" ]]; then
+            echo "::warning::Project lookup failed. Skipping project pre-insert. Details: $project_body"
+            exit 0
+          fi
+
+          pr_query='{"query":"query($owner:String!,$repo:String!,$prNumber:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$prNumber){id}}}","variables":{"owner":"'"$owner"'","repo":"'"$repo"'","prNumber":'"$pr"'}}'
+          pr_body=$(curl -sS -X POST https://api.github.com/graphql \
+            -H "Authorization: Bearer $PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$pr_query")
+
+          pr_id=$(echo "$pr_body" | sed -n 's/.*"pullRequest":{"id":"\([^"]*\)"}.*/\1/p')
+          if [[ -z "$pr_id" ]]; then
+            echo "::warning::PR node lookup failed. Skipping project pre-insert. Details: $pr_body"
+            exit 0
+          fi
+
+          existing_query='{"query":"query($prId:ID!){node(id:$prId){... on PullRequest{projectItems(first:100){nodes{project{id}}}}}}","variables":{"prId":"'"$pr_id"'"}}'
+          existing_body=$(curl -sS -X POST https://api.github.com/graphql \
+            -H "Authorization: Bearer $PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$existing_query")
+
+          if echo "$existing_body" | grep -q "$project_id"; then
+            echo "PR already exists in project table."
+            exit 0
+          fi
+
+          add_mutation='{"query":"mutation($projectId:ID!,$contentId:ID!){addProjectV2ItemById(input:{projectId:$projectId,contentId:$contentId}){item{id}}}","variables":{"projectId":"'"$project_id"'","contentId":"'"$pr_id"'"}}'
+          add_body=$(curl -sS -X POST https://api.github.com/graphql \
+            -H "Authorization: Bearer $PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$add_mutation")
+
+          if echo "$add_body" | grep -q '"errors"'; then
+            echo "::warning::Failed adding PR to project table. Continuing without blocking merge. Details: $add_body"
+            exit 0
+          fi
+
+          echo "PR inserted into project table successfully."
+
+      - if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' }}
+        uses: Integrations-dev/GitHub-Informer@v2
+        env:
+          # Use workflow token for repo/PR APIs; use PROJECT_TOKEN only for ProjectV2 operations.
+          GITHUB_TOKEN: ${{ github.token }}
+          # PROJECT_TOKEN is a protected environment secret, not a repo variable.
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          # Keep this unset unless the user wants PR thread reuse via GitHub Project V2.
+          CLIQ_THREAD_STORAGE_MODE: ${{ vars.CLIQ_THREAD_STORAGE_MODE }}
+          # Auto mode: resolve project id by owner + number.
+          GITHUB_PROJECT_OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          PROJECT_THREAD_FIELD_ID: ${{ vars.PROJECT_THREAD_FIELD_ID }}
+          # Auto mode: resolve field id by field name.
         with:
-          channel-endpoint: ${{ secrets.ENDPOINT }}
+          channel-endpoint: ${{ steps.prepare-cliq-endpoint.outputs.resolved-endpoint }}
           #branch-protection-rule-message: 'Security Update :Security:\n (event) (rule) is (action) by (me) at (repo) under (ref)'
           #check-run-message: 'Check Run Status :server:\n (event) (run) is (action) by (me) at (repo) under (ref)'
           #check-suite-message: 'Check Suite Status :server:\n (event) is (action) by (me) at (repo) under (ref)'
@@ -109,3 +512,269 @@ jobs:
           #ie. if a push occurs the push-message will be sent. In case it is not provided. The default-message will be sent. 
           #set-message-if-none: true
           #false makes GitHub-Informer not send the default messages if custom message is not set
+
+      - name: Guard forked PR write access
+        id: fork-guard
+        if: ${{ github.event_name == 'pull_request_target' }}
+        shell: bash
+        run: |
+          is_fork='${{ github.event.pull_request.head.repo.fork }}'
+          if [[ "$is_fork" == "true" ]]; then
+            echo "PR is from a forked repository. Skipping GitHub PR write actions because the default GITHUB_TOKEN cannot write to untrusted fork PRs."
+            echo "skip_write=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_write=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve AI review provider endpoint
+        id: resolve-ai-review-provider
+        if: ${{ github.event_name == 'pull_request_target' && env.AI_REVIEW_ENABLED == 'true' && steps.fork-guard.outputs.skip_write != 'true' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AI_REVIEW_SERVICE: ${{ env.AI_REVIEW_SERVICE }}
+          AI_REVIEW_MODEL: ${{ env.AI_REVIEW_MODEL }}
+          # USER CONFIG (environment secret): AI_REVIEW_TOKEN
+          # API key for the provider set in AI_REVIEW_SERVICE above. Required
+          # only when AI_REVIEW_ENABLED is true. NOTE: the token's format/prefix
+          # is intentionally NOT validated here anymore - Google is transitioning
+          # Gemini/AI Studio keys away from the old "AIza..." API-key format
+          # toward newer "auth key" formats, so a fixed prefix check is no
+          # longer reliable and would incorrectly reject valid keys. The
+          # service is trusted strictly from AI_REVIEW_SERVICE below; an
+          # actually-wrong/mismatched token will simply be rejected by the
+          # provider's API itself (typically 401/403).
+          AI_REVIEW_TOKEN: ${{ secrets.AI_REVIEW_TOKEN }}
+        run: |
+          # Posts a comment on the PR so the user is notified directly where
+          # they'll actually see it, instead of only failing silently in the
+          # Action run logs.
+          post_pr_comment() {
+            local body="$1"
+            local escaped_body
+            escaped_body=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)
+            if [[ -z "$escaped_body" ]]; then
+              # Fallback if python3 is unavailable: minimal manual JSON escaping.
+              escaped_body=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"} {print}')
+              escaped_body="\"$escaped_body\""
+            fi
+            curl -sS -o /dev/null \
+              -X POST "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": $escaped_body}"
+          }
+
+          service=$(printf '%s' "$AI_REVIEW_SERVICE" | tr '[:upper:]' '[:lower:]' | xargs)
+
+          # 1. AI_REVIEW_TOKEN missing/empty -> comment on PR and fail.
+          if [[ -z "$AI_REVIEW_TOKEN" ]]; then
+            post_pr_comment "### :warning: AI Review Gate — Action Required
+          AI review is **enabled** (\`AI_REVIEW_ENABLED: true\`) in \`CliqConnector.yml\`, but no \`AI_REVIEW_TOKEN\` secret has been configured.
+
+          **To fix:** add a repository/organization secret named \`AI_REVIEW_TOKEN\` containing a valid API key for the configured service (\`AI_REVIEW_SERVICE: $AI_REVIEW_SERVICE\`), or set \`AI_REVIEW_ENABLED: false\` in \`CliqConnector.yml\` if AI review is not needed."
+            echo "::error::AI_REVIEW_TOKEN secret is missing/empty while AI_REVIEW_ENABLED=true."
+            exit 1
+          fi
+
+          case "$service" in
+            openai)
+              api_url="https://api.openai.com/v1/chat/completions"
+              default_model="gpt-4.1-mini"
+              ;;
+            claude)
+              api_url="https://api.anthropic.com/v1/messages"
+              default_model="claude-3-5-sonnet-latest"
+              ;;
+            gemini)
+              # api_url is finalized after model resolution below, since Gemini's
+              # native REST endpoint embeds the model name inside the URL path
+              # itself (.../models/<model>:generateContent) rather than as a
+              # body field like OpenAI/Claude. Setting a placeholder here keeps
+              # the case/esac structure symmetric with the other providers.
+              default_model="gemini-2.5-flash"
+              ;;
+            *)
+              # 2. Invalid/unsupported AI_REVIEW_SERVICE -> comment on PR and fail.
+              post_pr_comment "### :warning: AI Review Gate — Action Required
+          \`AI_REVIEW_SERVICE: $AI_REVIEW_SERVICE\` in \`CliqConnector.yml\` is not a supported value.
+
+          **To fix:** set \`AI_REVIEW_SERVICE\` to one of: \`openai\`, \`claude\`, \`gemini\`."
+              echo "::error::Unsupported AI_REVIEW_SERVICE '$AI_REVIEW_SERVICE'. Use one of: openai, claude, gemini."
+              exit 1
+              ;;
+          esac
+
+          # NOTE: token-format validation against a fixed per-provider prefix (previously
+          # sk- / sk-ant- / AIza) has been intentionally removed. Google is transitioning
+          # Gemini/AI Studio keys away from the old "AIza..." API-key format toward newer
+          # "auth key" formats, so prefix matching is no longer a reliable, future-proof
+          # signal and would incorrectly reject valid Gemini keys going forward. The
+          # declared AI_REVIEW_SERVICE above is trusted as-is; if AI_REVIEW_TOKEN does not
+          # actually belong to that provider, the request will fail naturally at the
+          # provider's API (typically 401/403), which is surfaced later in the workflow.
+
+          # Empty AI_REVIEW_MODEL -> fall back to the provider's latest default model.
+          model="${AI_REVIEW_MODEL:-$default_model}"
+          if [[ -z "$(printf '%s' "$AI_REVIEW_MODEL" | xargs)" ]]; then
+            model="$default_model"
+          fi
+
+          # Gemini's api_url must be built dynamically from the resolved model
+          # (user-supplied AI_REVIEW_MODEL if set, otherwise default_model above),
+          # since the model name is part of the URL path for this provider.
+          if [[ "$service" == "gemini" ]]; then
+            api_url="https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent"
+          fi
+
+          echo "api-url=$api_url" >> "$GITHUB_OUTPUT"
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+
+      - name: Debug PR metadata for AI review
+        if: ${{ github.event_name == 'pull_request_target' }}
+        shell: bash
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "event_action=${{ github.event.action }}"
+          echo "repository=${{ github.repository }}"
+          echo "repo_owner=${{ github.repository_owner }}"
+          echo "pr_number=${{ github.event.pull_request.number }}"
+          echo "pr_title=${{ github.event.pull_request.title }}"
+          echo "pr_url=${{ github.event.pull_request.html_url }}"
+          echo "diff_url=${{ github.event.pull_request.diff_url }}"
+          echo "base_sha=${{ github.event.pull_request.base.sha }}"
+          echo "head_sha=${{ github.event.pull_request.head.sha }}"
+          echo "token_present=${{ secrets.GITHUB_TOKEN != '' }}"
+
+      - if: ${{ github.event_name == 'pull_request_target' && steps.fork-guard.outputs.skip_write != 'true' }}
+        uses: Integrations-dev/GitHub-Informer@v2
+        env:
+          # Use workflow token for repo/PR APIs; use PROJECT_TOKEN only for ProjectV2 operations.
+          GITHUB_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+          PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}
+          PULL_REQUEST_BODY: ${{ github.event.pull_request.body }}
+          PULL_REQUEST_URL: ${{ github.event.pull_request.html_url }}
+          # PROJECT_TOKEN is a protected environment secret, not a repo variable.
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          # Keep this unset unless the user wants PR thread reuse via GitHub Project V2.
+          CLIQ_THREAD_STORAGE_MODE: ${{ vars.CLIQ_THREAD_STORAGE_MODE }}
+          # Auto mode: resolve project id by owner + number.
+          GITHUB_PROJECT_OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          PROJECT_THREAD_FIELD_ID: ${{ vars.PROJECT_THREAD_FIELD_ID }}
+          # Auto mode: resolve field id by field name.
+          PULL_REQUEST_DIFF_URL: ${{ github.event.pull_request.diff_url }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          channel-endpoint: ${{ steps.prepare-cliq-endpoint.outputs.resolved-endpoint }}
+          # AI_REVIEW_ENABLED: see "USER CONFIG (in-file)" note above (env block).
+          ai-review-enabled: ${{ env.AI_REVIEW_ENABLED }}
+          ai-review-trigger: auto
+          ai-review-on-sync: true
+          ai-review-check-name: AI Review Gate
+          # ai-review-token: see "USER CONFIG (environment secret): AI_REVIEW_TOKEN" note above.
+          ai-review-token: ${{ secrets.AI_REVIEW_TOKEN }}
+          # USER CONFIG (in-file): AI_REVIEW_SERVICE — declared service, passed through
+          # as-is. This is now the SOLE source of truth for both ROUTING (endpoint/
+          # payload) and MODEL validation in the action - ai-review-token's format
+          # is never inspected to guess or override it, so keep this value matching
+          # whichever provider AI_REVIEW_TOKEN actually belongs to.
+          ai-review-service: ${{ env.AI_REVIEW_SERVICE }}
+          # Resolved above from AI_REVIEW_SERVICE (openai | claude | gemini) —
+          # see "USER CONFIG (in-file): AI_REVIEW_SERVICE" note above.
+          ai-review-api-url: ${{ steps.resolve-ai-review-provider.outputs.api-url }}
+          ai-review-model: ${{ steps.resolve-ai-review-provider.outputs.model }}
+          # Diff URL from the PR event, used to fetch the latest patch reliably.
+          # This should be read by the action from the event environment.
+
+      - name: Comment PR on Cliq failure
+        if: ${{ failure() && github.event_name == 'pull_request_target' && github.event.pull_request.number != '' && steps.fork-guard.outputs.skip_write != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body='### ⚠️ Cliq notification failed
+
+          The workflow failed while posting to Cliq.
+
+          Reason:
+          - `bot_not_member`
+
+          Please verify the bot membership in the Cliq channel, bot configuration, and webhook/channel permissions.'
+
+      - name: Ensure AI Review Gate check is reported
+        if: ${{ github.event_name == 'pull_request_target' && steps.fork-guard.outputs.skip_write != 'true' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHECK_NAME: AI Review Gate
+          PR_ACTION: ${{ github.event.action }}
+          AI_REVIEW_ON_SYNC: true
+        run: |
+          expected=false
+          if [[ "$PR_ACTION" == "opened" || "$PR_ACTION" == "reopened" ]]; then
+            expected=true
+          elif [[ "$PR_ACTION" == "synchronize" && "$AI_REVIEW_ON_SYNC" == "true" ]]; then
+            expected=true
+          fi
+
+          if [[ "$expected" != "true" ]]; then
+            echo "AI Review Gate is not expected for pull_request_target action '$PR_ACTION'. Skipping safeguard."
+            exit 0
+          fi
+
+          encoded_check_name=$(printf '%s' "$CHECK_NAME" | sed 's/ /%20/g')
+          checks_url="https://api.github.com/repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100&check_name=$encoded_check_name"
+          # GitHub check-runs API can be eventually consistent for a short time.
+          # Wait up to ~60 seconds before declaring the check missing.
+          check_found=false 
+          for attempt in {1..12}; do
+            checks_body=$(curl -sS \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "$checks_url")
+
+            if echo "$checks_body" | tr -d '\n' | grep -Eq '"total_count"[[:space:]]*:[[:space:]]*[1-9]'; then
+              check_found=true
+              echo "AI Review Gate check already reported (attempt $attempt)."
+              break
+            fi
+
+            echo "AI Review Gate check not visible yet (attempt $attempt/12)."
+            sleep 5
+          done
+
+          if [[ "$check_found" == "true" ]]; then
+            exit 0
+          fi
+
+          payload=$(cat <<EOF
+          {
+            "name": "$CHECK_NAME",
+            "head_sha": "$HEAD_SHA",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {
+              "title": "$CHECK_NAME",
+              "summary": "AI Review Gate was not reported by the action.",
+              "text": "Strict mode: a failing safeguard check was created because no AI Review Gate status was found after retry. Verify AI_REVIEW_TOKEN, provider endpoint/model, and action logs."
+            }
+          }
+          EOF
+          )
+
+          create_body=$(curl -sS \
+            -X POST "https://api.github.com/repos/$REPO/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          echo "Safeguard AI Review Gate response: $create_body"
